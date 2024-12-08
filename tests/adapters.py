@@ -6,6 +6,9 @@ from typing import IO, BinaryIO, Iterable, Optional, Type
 
 import numpy.typing as npt
 import torch
+import regex as re
+from .util import get_stats, merge
+from collections import defaultdict
 
 
 def run_positionwise_feedforward(
@@ -569,4 +572,34 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    pre_tokenize_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+ 
+    text = open(input_path, 'r', encoding='utf8').read()
+    text_chunks = re.findall(pre_tokenize_pattern, text)
+
+    ids = [list(word.encode("utf8")) for word in text_chunks]
+
+    merges = []
+    vocabs = {idx: bytes([idx]) for idx in range(256)}
+    num_merges = vocab_size - 256 - len(special_tokens)
+
+    idx = len(vocabs)
+    for i in range(num_merges):
+        stats = {}
+        for chunk_ids in ids:
+            get_stats(chunk_ids, stats)
+
+        pair = max(stats, key=stats.get)
+        ids = [merge(chunk_ids, pair, idx) for chunk_ids in ids]
+        merges.append((vocabs[pair[0]], vocabs[pair[1]]))
+        vocabs[idx] = vocabs[pair[0]] + vocabs[pair[1]]
+        idx += 1
+
+    idx = len(vocabs)
+    for spe_tk in special_tokens:
+        vocabs[idx] = spe_tk
+        idx += 1
+
+    return vocabs, merges
+
