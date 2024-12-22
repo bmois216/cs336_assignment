@@ -7,7 +7,6 @@ from typing import IO, BinaryIO, Iterable, Optional, Type
 import numpy.typing as npt
 import torch
 import regex as re
-from .util import get_stats, merge
 from collections import defaultdict
 
 
@@ -574,32 +573,72 @@ def run_train_bpe(
     """
 
     pre_tokenize_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
- 
+
     text = open(input_path, 'r', encoding='utf8').read()
     text_chunks = re.findall(pre_tokenize_pattern, text)
+    words_frequence = {}
+    for word in text_chunks:
+        key = tuple(list(word.encode('utf8')))
+        words_frequence[key] = words_frequence.get(key, 0) + 1
 
-    ids = [list(word.encode("utf8")) for word in text_chunks]
 
+    # 1. init vocab
+    vocab = {i:bytes([i]) for i in range(256)}
+    index = len(vocab)
+    for sp_token in special_tokens:
+        vocab[index] = sp_token.encode('utf8')
+        index += 1
+
+
+    # 2. pair to words
+    pair2words = {}
+    pair_frequence = {}
+    for word, freq in words_frequence.items():
+        for pair in zip(word, word[1:]):
+            pair_frequence[pair] = pair_frequence.get(pair, 0) + freq
+
+            if pair not in pair2words or word not in pair2words[pair]:
+                pair2words[pair] = pair2words.get(pair, []) + [word]
+        
+
+    # 3. trains
     merges = []
-    vocabs = {idx: bytes([idx]) for idx in range(256)}
-    num_merges = vocab_size - 256 - len(special_tokens)
+    while len(vocab) < vocab_size:
+        max_freq_pair = max(pair_frequence, key=lambda k:(pair_frequence[k], k))
 
-    idx = len(vocabs)
-    for i in range(num_merges):
-        stats = {}
-        for chunk_ids in ids:
-            get_stats(chunk_ids, stats)
+        vocab[index] = vocab[max_freq_pair[0]] + vocab[max_freq_pair[1]]
+        merges.append((vocab[max_freq_pair[0]], vocab[max_freq_pair[1]]))
 
-        pair = max(stats, key=stats.get)
-        ids = [merge(chunk_ids, pair, idx) for chunk_ids in ids]
-        merges.append((vocabs[pair[0]], vocabs[pair[1]]))
-        vocabs[idx] = vocabs[pair[0]] + vocabs[pair[1]]
-        idx += 1
+        for word in pair2words[max_freq_pair]:
+            cnt = words_frequence[word]
+            i = 0
+            new_word = []
+            while i < len(word):
+                if word[i] == max_freq_pair[0] and i + 1 < len(word) and word[i + 1] == max_freq_pair[1]:
+                    new_word.append(index)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            new_word = tuple(new_word)
+            words_frequence[new_word] = cnt
 
-    idx = len(vocabs)
-    for spe_tk in special_tokens:
-        vocabs[idx] = spe_tk
-        idx += 1
+            for pair in zip(word, word[1:]):
+                pair_frequence[pair] -= cnt
 
-    return vocabs, merges
+                if word in pair2words[pair]:
+                    pair2words[pair].remove(word)
+
+            for pair in zip(new_word, new_word[1:]):
+                pair_frequence[pair] = pair_frequence.get(pair, 0) + cnt
+
+                if pair not in pair2words or new_word not in pair2words[pair]:
+                    pair2words[pair] = pair2words.get(pair, []) + [new_word]
+
+        # del pair_frequence[pair]
+        # del pair2words[pair]
+        index += 1
+                
+            
+    return vocab, merges
 
