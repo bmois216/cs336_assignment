@@ -6,8 +6,10 @@ from typing import IO, BinaryIO, Iterable, Optional, Type
 
 import numpy.typing as npt
 import torch
+import torch.nn.functional as F
 import regex as re
-from collections import defaultdict
+from collections import defaultdict, Counter
+from .model import RMSNorm, GELU, FFN
 
 
 def run_positionwise_feedforward(
@@ -45,7 +47,13 @@ def run_positionwise_feedforward(
     # You can also manually assign the weights
     # my_ffn.w1.weight.data = weights["w1.weight"]
     # my_ffn.w2.weight.data = weights["w2.weight"]
-    raise NotImplementedError
+
+    ffn = FFN(d_model=d_model, d_fnn=d_ff)
+    ffn.load_state_dict(weights)
+
+    output = ffn(in_features)
+
+    return output
 
 
 def run_scaled_dot_product_attention(
@@ -87,7 +95,26 @@ def run_scaled_dot_product_attention(
         with the output of running your scaled dot product attention
         implementation with the provided key, query, and value tensors.
     """
-    raise NotImplementedError
+    tmp_Q = torch.unsqueeze(Q, dim=1) if len(Q.shape) == 3 else Q
+    tmp_K = torch.unsqueeze(K, dim=1) if len(K.shape) == 3 else K
+    tmp_V = torch.unsqueeze(V, dim=1) if len(V.shape) == 3 else V
+    
+    d_k = tmp_Q.shape[-1]
+    qk = tmp_Q @ tmp_K.transpose(2,3) / (d_k ** 0.5)
+
+    if mask is not None:
+        mask_values = torch.where(mask, float('-inf'), 0.0)
+        qk = qk + mask_values
+
+    softmax_dk = run_softmax(qk, dim=-1)
+    output = softmax_dk @ tmp_V
+
+    output = torch.squeeze(output) if len(Q.shape) == 3 else output
+
+    if pdrop is not None:
+        output = F.dropout(output, p=pdrop, training=True)
+
+    return output
 
 
 def run_multihead_self_attention(
@@ -137,8 +164,22 @@ def run_multihead_self_attention(
         torch.FloatTensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    concated_q_weight = torch.concat([weights[f"q_heads.{i}.weight"] for i in range(num_heads)], dim=0) # (head * d_key, d_model)
+    concated_k_weight = torch.concat([weights[f"k_heads.{i}.weight"] for i in range(num_heads)], dim=0)
+    concated_v_weight = torch.concat([weights[f"v_heads.{i}.weight"] for i in range(num_heads)], dim=0)
 
+    query = in_features @ concated_q_weight.T   # (batch_size, seq_length, d_model) * (d_model, head * d_key) -> (batch_size, seq_length, head * d_key)
+    key = in_features @ concated_k_weight.T
+    value = in_features @ concated_v_weight.T
+
+    seq_length = in_features.shape[-2]
+    casual_mask = torch.tril(torch.ones(seq_length, seq_length)).bool()
+
+    output = run_scaled_dot_product_attention(key, query, value, casual_mask, attn_pdrop)   #(batch_size, seq_length, head * d_key)
+    output = output @ weights["output_proj.weight"].T
+
+    return output
+    
 
 def run_transformer_block(
     d_model: int,
@@ -333,7 +374,13 @@ def run_rmsnorm(
         FloatTensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+
+    rms = RMSNorm(d_model=d_model, eps=eps)
+    rms.load_state_dict(weights)
+
+    output = rms(in_features)
+
+    return output
 
 
 def run_gelu(in_features: torch.FloatTensor) -> torch.FloatTensor:
@@ -348,7 +395,9 @@ def run_gelu(in_features: torch.FloatTensor) -> torch.FloatTensor:
         FloatTensor of with the same shape as `in_features` with the output of applying
         GELU to each element.
     """
-    raise NotImplementedError
+    gelu = GELU()
+
+    return gelu(in_features)
 
 
 def run_get_batch(
@@ -392,7 +441,14 @@ def run_softmax(in_features: torch.FloatTensor, dim: int) -> torch.FloatTensor:
         FloatTensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    scaled_num = torch.unsqueeze(torch.max(in_features, axis=dim)[0], dim=-1)
+    scaled_in_features = in_features - scaled_num
+
+    exp_num = torch.exp(scaled_in_features)
+    output = exp_num / torch.unsqueeze(torch.sum(exp_num, axis=dim), dim=dim)
+
+    return output
+
 
 
 def run_cross_entropy(inputs: torch.FloatTensor, targets: torch.LongTensor):
@@ -572,73 +628,73 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
 
+    # 1. pretoken and init vocab
     pre_tokenize_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
     text = open(input_path, 'r', encoding='utf8').read()
-    text_chunks = re.findall(pre_tokenize_pattern, text)
-    words_frequence = {}
-    for word in text_chunks:
-        key = tuple(list(word.encode('utf8')))
-        words_frequence[key] = words_frequence.get(key, 0) + 1
+    pretokens = Counter(re.findall(pre_tokenize_pattern, text))
+    gen_tuple_of_bytes = lambda pretoken: tuple([bytes([b]) for b in pretoken.encode('utf8')])
+    pretoken_freq = Counter()
+    for pretoken, freq in pretokens.items():
+        pretoken_freq[gen_tuple_of_bytes(pretoken)] = freq
 
-
-    # 1. init vocab
     vocab = {i:bytes([i]) for i in range(256)}
     index = len(vocab)
-    for sp_token in special_tokens:
-        vocab[index] = sp_token.encode('utf8')
+    for token in special_tokens:
+        vocab[index] = token.encode('utf8')
         index += 1
 
-
-    # 2. pair to words
-    pair2words = {}
-    pair_frequence = {}
-    for word, freq in words_frequence.items():
-        for pair in zip(word, word[1:]):
-            pair_frequence[pair] = pair_frequence.get(pair, 0) + freq
-
-            if pair not in pair2words or word not in pair2words[pair]:
-                pair2words[pair] = pair2words.get(pair, []) + [word]
+    # 2. pair frequence
+    pair_freq = Counter()
+    for pretoken, freq in pretoken_freq.items():
+        for pair in zip(pretoken, pretoken[1:]):
+            pair_freq[pair] = pair_freq.get(pair, 0) + freq
         
 
     # 3. trains
     merges = []
     while len(vocab) < vocab_size:
-        max_freq_pair = max(pair_frequence, key=lambda k:(pair_frequence[k], k))
+        most_freq_pair = max(pair_freq, key=lambda k:(pair_freq[k], k))
 
-        vocab[index] = vocab[max_freq_pair[0]] + vocab[max_freq_pair[1]]
-        merges.append((vocab[max_freq_pair[0]], vocab[max_freq_pair[1]]))
+        merges.append(most_freq_pair)
+        new_idx = max(vocab.keys()) + 1
+        vocab[new_idx] = b"".join(most_freq_pair)
 
-        for word in pair2words[max_freq_pair]:
-            cnt = words_frequence[word]
+        new_pretoken_freq = {}
+        for pretoken_tuple, freq in pretoken_freq.items():
             i = 0
-            new_word = []
-            while i < len(word):
-                if word[i] == max_freq_pair[0] and i + 1 < len(word) and word[i + 1] == max_freq_pair[1]:
-                    new_word.append(index)
-                    i += 2
-                else:
-                    new_word.append(word[i])
-                    i += 1
-            new_word = tuple(new_word)
-            words_frequence[new_word] = cnt
+            while i < len(pretoken_tuple):
+                pair = pretoken_tuple[i:i+2]
+                if pair == most_freq_pair:
+                    pretoken_tuple, prefix, suffix = _update_byte_tuple(pretoken_tuple, i)
 
-            for pair in zip(word, word[1:]):
-                pair_frequence[pair] -= cnt
-
-                if word in pair2words[pair]:
-                    pair2words[pair].remove(word)
-
-            for pair in zip(new_word, new_word[1:]):
-                pair_frequence[pair] = pair_frequence.get(pair, 0) + cnt
-
-                if pair not in pair2words or new_word not in pair2words[pair]:
-                    pair2words[pair] = pair2words.get(pair, []) + [new_word]
-
-        # del pair_frequence[pair]
-        # del pair2words[pair]
-        index += 1
+                    if prefix:
+                        add_pair = (prefix[-1], vocab[new_idx])
+                        pair_freq[add_pair] = pair_freq.get(add_pair, 0) + freq
+                        del_pair = (prefix[-1], most_freq_pair[0])
+                        pair_freq[del_pair] -= freq
+                    
+                    if suffix:
+                        add_pair = (vocab[new_idx], suffix[0])
+                        pair_freq[add_pair] = pair_freq.get(add_pair, 0) + freq
+                        del_pair = (most_freq_pair[1], suffix[0])
+                        pair_freq[del_pair] -= freq
+                    
+                    pair_freq[most_freq_pair] -= freq
                 
+                i += 1
+
+            new_pretoken_freq[pretoken_tuple] = freq
+        pretoken_freq = new_pretoken_freq
             
     return vocab, merges
 
+def _update_byte_tuple(byte_tuple, merge_loc):
+    assert len(byte_tuple) > 1, "byte tuple length <= 1, can't merge!"
+    prefix = byte_tuple[:merge_loc]
+    tomerge = byte_tuple[merge_loc:merge_loc+2]
+    suffix = byte_tuple[merge_loc+2:]
+
+    new_byte_tuple = prefix + (b"".join(tomerge),) + suffix
+
+    return new_byte_tuple, prefix, suffix
