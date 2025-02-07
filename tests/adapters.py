@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 import regex as re
 from collections import defaultdict, Counter
-from .model import RMSNorm, GELU, FFN
+from .model import RMSNorm, GELU, FFN, softmax, scaled_dot_product_attention, MultiHeadSelfAttention, TransformerBlock, TransformerLM
 
 
 def run_positionwise_feedforward(
@@ -95,24 +95,8 @@ def run_scaled_dot_product_attention(
         with the output of running your scaled dot product attention
         implementation with the provided key, query, and value tensors.
     """
-    tmp_Q = torch.unsqueeze(Q, dim=1) if len(Q.shape) == 3 else Q
-    tmp_K = torch.unsqueeze(K, dim=1) if len(K.shape) == 3 else K
-    tmp_V = torch.unsqueeze(V, dim=1) if len(V.shape) == 3 else V
-    
-    d_k = tmp_Q.shape[-1]
-    qk = tmp_Q @ tmp_K.transpose(2,3) / (d_k ** 0.5)
 
-    if mask is not None:
-        mask_values = torch.where(mask, float('-inf'), 0.0)
-        qk = qk + mask_values
-
-    softmax_dk = run_softmax(qk, dim=-1)
-    output = softmax_dk @ tmp_V
-
-    output = torch.squeeze(output) if len(Q.shape) == 3 else output
-
-    if pdrop is not None:
-        output = F.dropout(output, p=pdrop, training=True)
+    output = scaled_dot_product_attention(K, Q, V, mask, pdrop)
 
     return output
 
@@ -164,19 +148,18 @@ def run_multihead_self_attention(
         torch.FloatTensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    concated_q_weight = torch.concat([weights[f"q_heads.{i}.weight"] for i in range(num_heads)], dim=0) # (head * d_key, d_model)
-    concated_k_weight = torch.concat([weights[f"k_heads.{i}.weight"] for i in range(num_heads)], dim=0)
-    concated_v_weight = torch.concat([weights[f"v_heads.{i}.weight"] for i in range(num_heads)], dim=0)
+    multi_head_self_attn = MultiHeadSelfAttention(d_model, num_heads, attn_pdrop)
 
-    query = in_features @ concated_q_weight.T   # (batch_size, seq_length, d_model) * (d_model, head * d_key) -> (batch_size, seq_length, head * d_key)
-    key = in_features @ concated_k_weight.T
-    value = in_features @ concated_v_weight.T
+    # load weight
+    d_k = d_model // num_heads
+    for i in range(num_heads):
+        multi_head_self_attn.q_proj.weight.data[i*d_k:(i+1)*d_k] = weights[f"q_heads.{i}.weight"]
+        multi_head_self_attn.k_proj.weight.data[i*d_k:(i+1)*d_k] = weights[f"k_heads.{i}.weight"]
+        multi_head_self_attn.v_proj.weight.data[i*d_k:(i+1)*d_k] = weights[f"v_heads.{i}.weight"]
 
-    seq_length = in_features.shape[-2]
-    casual_mask = torch.tril(torch.ones(seq_length, seq_length)).bool()
+    multi_head_self_attn.output_proj.weight.data = weights['output_proj.weight']
 
-    output = run_scaled_dot_product_attention(key, query, value, casual_mask, attn_pdrop)   #(batch_size, seq_length, head * d_key)
-    output = output @ weights["output_proj.weight"].T
+    output = multi_head_self_attn(in_features)
 
     return output
     
@@ -250,7 +233,23 @@ def run_transformer_block(
         FloatTensor of shape (batch_size, sequence_length, d_model) with the output of
         running the Transformer block on the input features.
     """
-    raise NotImplementedError
+    transformer_block = TransformerBlock(d_model, d_ff, num_heads, attn_pdrop, residual_pdrop)
+
+    # init params
+    transformer_block.attn.q_proj.weight.data = weights['attn.q_proj.weight']
+    transformer_block.attn.k_proj.weight.data = weights['attn.k_proj.weight']
+    transformer_block.attn.v_proj.weight.data = weights['attn.v_proj.weight']
+    transformer_block.attn.output_proj.weight.data = weights['attn.output_proj.weight']
+
+    transformer_block.ln1.weight.data = weights['ln1.weight']
+    transformer_block.ln2.weight.data = weights['ln2.weight']
+
+    transformer_block.ffn.w1.data = weights['ffn.w1.weight']
+    transformer_block.ffn.w2.data = weights['ffn.w2.weight']
+
+    output = transformer_block(in_features)
+
+    return output
 
 
 def run_transformer_lm(
@@ -343,7 +342,33 @@ def run_transformer_lm(
         FloatTensor of shape (batch size, sequence_length, vocab_size) with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    transformer_lm = TransformerLM(vocab_size, context_length, d_model, residual_pdrop, num_layers, d_ff, num_heads, attn_pdrop)
+
+    # init params
+    transformer_lm.load_state_dict(weights)
+
+    # transformer_lm.token_embedding.weight.data = weights['token_embeddings.weight']
+    # transformer_lm.position_embedding.weight.data = weights['position_embeddings.weight']
+
+    # for i in range(num_layers):
+    #     transformer_lm.transformer[i].attn.q_proj.weight.data = weights[f'layers.{i}.attn.q_proj.weight']
+    #     transformer_lm.transformer[i].attn.k_proj.weight.data = weights[f'layers.{i}.attn.k_proj.weight']
+    #     transformer_lm.transformer[i].attn.v_proj.weight.data = weights[f'layers.{i}.attn.v_proj.weight']
+    #     transformer_lm.transformer[i].attn.output_proj.weight.data = weights[f'layers.{i}.attn.output_proj.weight']
+
+    #     transformer_lm.transformer[i].ln1.weight.data = weights[f'layers.{i}.ln1.weight']
+    #     transformer_lm.transformer[i].ln2.weight.data = weights[f'layers.{i}.ln2.weight']
+
+    #     transformer_lm.transformer[i].ffn.w1.data = weights[f'layers.{i}.ffn.w1.weight']
+    #     transformer_lm.transformer[i].ffn.w2.data = weights[f'layers.{i}.ffn.w2.weight']
+
+    # transformer_lm.ln_final.weight.data = weights['ln_final.weight']
+    # transformer_lm.output_proj.weight.data = weights['lm_head.weight']
+
+    output = transformer_lm(in_indices)
+    # output = softmax(output, dim=-1)
+
+    return output
 
 
 def run_rmsnorm(
@@ -441,11 +466,7 @@ def run_softmax(in_features: torch.FloatTensor, dim: int) -> torch.FloatTensor:
         FloatTensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    scaled_num = torch.unsqueeze(torch.max(in_features, axis=dim)[0], dim=-1)
-    scaled_in_features = in_features - scaled_num
-
-    exp_num = torch.exp(scaled_in_features)
-    output = exp_num / torch.unsqueeze(torch.sum(exp_num, axis=dim), dim=dim)
+    output = softmax(in_features, dim)
 
     return output
 
