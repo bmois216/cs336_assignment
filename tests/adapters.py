@@ -10,6 +10,9 @@ import torch.nn.functional as F
 import regex as re
 from collections import defaultdict, Counter
 from .model import RMSNorm, GELU, FFN, softmax, scaled_dot_product_attention, MultiHeadSelfAttention, TransformerBlock, TransformerLM
+from .train_bpe import train_bpe
+from .loss import cross_entropy_loss
+from .optimizer import AdamW
 
 
 def run_positionwise_feedforward(
@@ -487,7 +490,8 @@ def run_cross_entropy(inputs: torch.FloatTensor, targets: torch.LongTensor):
     Returns:
         Tensor of shape () with the average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    output = cross_entropy_loss(inputs, targets)
+    return output
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float):
@@ -509,7 +513,7 @@ def get_adamw_cls() -> Type[torch.optim.Optimizer]:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -649,73 +653,77 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
 
-    # 1. pretoken and init vocab
-    pre_tokenize_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    vocab, merges = train_bpe(input_path, vocab_size, special_tokens)
 
-    text = open(input_path, 'r', encoding='utf8').read()
-    pretokens = Counter(re.findall(pre_tokenize_pattern, text))
-    gen_tuple_of_bytes = lambda pretoken: tuple([bytes([b]) for b in pretoken.encode('utf8')])
-    pretoken_freq = Counter()
-    for pretoken, freq in pretokens.items():
-        pretoken_freq[gen_tuple_of_bytes(pretoken)] = freq
-
-    vocab = {i:bytes([i]) for i in range(256)}
-    index = len(vocab)
-    for token in special_tokens:
-        vocab[index] = token.encode('utf8')
-        index += 1
-
-    # 2. pair frequence
-    pair_freq = Counter()
-    for pretoken, freq in pretoken_freq.items():
-        for pair in zip(pretoken, pretoken[1:]):
-            pair_freq[pair] = pair_freq.get(pair, 0) + freq
-        
-
-    # 3. trains
-    merges = []
-    while len(vocab) < vocab_size:
-        most_freq_pair = max(pair_freq, key=lambda k:(pair_freq[k], k))
-
-        merges.append(most_freq_pair)
-        new_idx = max(vocab.keys()) + 1
-        vocab[new_idx] = b"".join(most_freq_pair)
-
-        new_pretoken_freq = {}
-        for pretoken_tuple, freq in pretoken_freq.items():
-            i = 0
-            while i < len(pretoken_tuple):
-                pair = pretoken_tuple[i:i+2]
-                if pair == most_freq_pair:
-                    pretoken_tuple, prefix, suffix = _update_byte_tuple(pretoken_tuple, i)
-
-                    if prefix:
-                        add_pair = (prefix[-1], vocab[new_idx])
-                        pair_freq[add_pair] = pair_freq.get(add_pair, 0) + freq
-                        del_pair = (prefix[-1], most_freq_pair[0])
-                        pair_freq[del_pair] -= freq
-                    
-                    if suffix:
-                        add_pair = (vocab[new_idx], suffix[0])
-                        pair_freq[add_pair] = pair_freq.get(add_pair, 0) + freq
-                        del_pair = (most_freq_pair[1], suffix[0])
-                        pair_freq[del_pair] -= freq
-                    
-                    pair_freq[most_freq_pair] -= freq
-                
-                i += 1
-
-            new_pretoken_freq[pretoken_tuple] = freq
-        pretoken_freq = new_pretoken_freq
-            
     return vocab, merges
 
-def _update_byte_tuple(byte_tuple, merge_loc):
-    assert len(byte_tuple) > 1, "byte tuple length <= 1, can't merge!"
-    prefix = byte_tuple[:merge_loc]
-    tomerge = byte_tuple[merge_loc:merge_loc+2]
-    suffix = byte_tuple[merge_loc+2:]
+#     # 1. pretoken and init vocab
+#     pre_tokenize_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-    new_byte_tuple = prefix + (b"".join(tomerge),) + suffix
+#     text = open(input_path, 'r', encoding='utf8').read()
+#     pretokens = Counter(re.findall(pre_tokenize_pattern, text))
+#     gen_tuple_of_bytes = lambda pretoken: tuple([bytes([b]) for b in pretoken.encode('utf8')])
+#     pretoken_freq = Counter()
+#     for pretoken, freq in pretokens.items():
+#         pretoken_freq[gen_tuple_of_bytes(pretoken)] = freq
 
-    return new_byte_tuple, prefix, suffix
+#     vocab = {i:bytes([i]) for i in range(256)}
+#     index = len(vocab)
+#     for token in special_tokens:
+#         vocab[index] = token.encode('utf8')
+#         index += 1
+
+#     # 2. pair frequence
+#     pair_freq = Counter()
+#     for pretoken, freq in pretoken_freq.items():
+#         for pair in zip(pretoken, pretoken[1:]):
+#             pair_freq[pair] = pair_freq.get(pair, 0) + freq
+        
+
+#     # 3. trains
+#     merges = []
+#     while len(vocab) < vocab_size:
+#         most_freq_pair = max(pair_freq, key=lambda k:(pair_freq[k], k))
+
+#         merges.append(most_freq_pair)
+#         new_idx = max(vocab.keys()) + 1
+#         vocab[new_idx] = b"".join(most_freq_pair)
+
+#         new_pretoken_freq = {}
+#         for pretoken_tuple, freq in pretoken_freq.items():
+#             i = 0
+#             while i < len(pretoken_tuple):
+#                 pair = pretoken_tuple[i:i+2]
+#                 if pair == most_freq_pair:
+#                     pretoken_tuple, prefix, suffix = _update_byte_tuple(pretoken_tuple, i)
+
+#                     if prefix:
+#                         add_pair = (prefix[-1], vocab[new_idx])
+#                         pair_freq[add_pair] = pair_freq.get(add_pair, 0) + freq
+#                         del_pair = (prefix[-1], most_freq_pair[0])
+#                         pair_freq[del_pair] -= freq
+                    
+#                     if suffix:
+#                         add_pair = (vocab[new_idx], suffix[0])
+#                         pair_freq[add_pair] = pair_freq.get(add_pair, 0) + freq
+#                         del_pair = (most_freq_pair[1], suffix[0])
+#                         pair_freq[del_pair] -= freq
+                    
+#                     pair_freq[most_freq_pair] -= freq
+                
+#                 i += 1
+
+#             new_pretoken_freq[pretoken_tuple] = freq
+#         pretoken_freq = new_pretoken_freq
+            
+#     return vocab, merges
+
+# def _update_byte_tuple(byte_tuple, merge_loc):
+#     assert len(byte_tuple) > 1, "byte tuple length <= 1, can't merge!"
+#     prefix = byte_tuple[:merge_loc]
+#     tomerge = byte_tuple[merge_loc:merge_loc+2]
+#     suffix = byte_tuple[merge_loc+2:]
+
+#     new_byte_tuple = prefix + (b"".join(tomerge),) + suffix
+
+#     return new_byte_tuple, prefix, suffix
