@@ -9,10 +9,11 @@ import torch
 import torch.nn.functional as F
 import regex as re
 from collections import defaultdict, Counter
-from .model import RMSNorm, GELU, FFN, softmax, scaled_dot_product_attention, MultiHeadSelfAttention, TransformerBlock, TransformerLM
-from .train_bpe import train_bpe
-from .loss import cross_entropy_loss
-from .optimizer import AdamW
+from ..src.model import RMSNorm, GELU, FFN, softmax, scaled_dot_product_attention, MultiHeadSelfAttention, TransformerBlock, TransformerLM
+# from .train_bpe import train_bpe
+from ..src.loss import cross_entropy_loss
+from ..src.optimizer import AdamW
+from ..src.tokenizer import BaseTokenizer
 
 
 def run_positionwise_feedforward(
@@ -619,7 +620,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return BaseTokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
